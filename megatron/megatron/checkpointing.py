@@ -108,8 +108,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
-    if isinstance(model, torchDDP):
-        model = model.module
+    unwrapped_model = []
+    for model_module in model:
+        if isinstance(model_module, torchDDP):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    model = unwrapped_model
 
     if torch.distributed.get_rank() == 0:
         print('saving checkpoint at iteration {:7d} to {}'.format(
@@ -122,7 +126,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         state_dict['args'] = args
         state_dict['checkpoint_version'] = 3.0
         state_dict['iteration'] = iteration
-        state_dict['model'] = model.state_dict_for_save_checkpoint()
+        if len(model) == 1:
+            state_dict['model'] = model[0].state_dict_for_save_checkpoint()
+        else:
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
 
         # Optimizer stuff.
         if not args.no_save_optim:
@@ -164,8 +173,13 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    if isinstance(model, torchDDP):
-        model = model.module
+    unwrapped_model = []
+    for model_module in model:
+        if isinstance(model_module, torchDDP):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    model = unwrapped_model
+
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
@@ -252,7 +266,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
-    model.load_state_dict(state_dict['model'])
+    if len(model) == 1:
+        model[0].load_state_dict(state_dict['model'])
+    else:
+        for i in range(len(model)):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            model[i].load_state_dict(state_dict['model%d' % i])
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:

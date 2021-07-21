@@ -83,7 +83,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         try:
             from megatron.data import helpers
         except:
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() % 8 == 0:
                 from megatron.data.dataset_utils import compile_helper
                 compile_helper()
             # Simple barrier
@@ -136,7 +136,8 @@ def _initialize_distributed():
             print('model parallel is already initialized')
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
-                                          args.pipeline_model_parallel_size)
+                                          args.pipeline_model_parallel_size,
+                                          args.virtual_pipeline_model_parallel_size)
 
 
 def _init_autoresume():

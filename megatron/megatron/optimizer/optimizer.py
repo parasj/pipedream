@@ -131,11 +131,12 @@ class MegatronOptimizer(ABC):
 
 class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
-    def __init__(self, optimizer, grad_scaler, clip_grad):
+    def __init__(self, optimizer, grad_scaler, clip_grad, weight_stashing=False):
         super(FP16OptimizerWithFP16Params, self).__init__(optimizer)
 
         self.grad_scaler = grad_scaler
         self.clip_grad = clip_grad
+        self.weight_stashing = weight_stashing
 
         # Tensor used to determine if a nan/if has happend.
         # Any non-zero value indicates inf/nan.
@@ -155,12 +156,21 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         self.fp16_groups = []
         self.fp32_from_fp16_groups = []
         self.fp32_from_fp32_groups = []
+        if self.weight_stashing:
+            self.main_version = 0
+            self.copy_version = 0
+            self.current_model_fp16_version = 0
+            self.fp32_from_fp16_groups_copy = []
+            self.fp32_from_fp32_groups_copy = []
 
         # For all the groups in the original optimizer:
         for param_group in self.optimizer.param_groups:
             fp16_params_this_group = []
             fp32_params_this_group = []
             fp32_from_fp16_params_this_group = []
+            if self.weight_stashing:
+                fp32_params_this_group_copy = []
+                fp32_from_fp16_params_this_group_copy = []
             # For all the parameters in this group:
             for i, param in enumerate(param_group['params']):
                 if param.requires_grad:
@@ -180,6 +190,8 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                         # Replace the optimizer params with the new fp32 copy.
                         param_group['params'][i] = main_param
                         fp32_from_fp16_params_this_group.append(main_param)
+                        if self.weight_stashing:
+                            fp32_from_fp16_params_this_group_copy.append(main_param.detach().clone())
                         # Reset existing state dict key to the new main param.
                         if param in self.optimizer.state:
                             self.optimizer.state[main_param] \
@@ -188,6 +200,8 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                     # fp32 params.
                     elif param.type() == 'torch.cuda.FloatTensor':
                         fp32_params_this_group.append(param)
+                        if self.weight_stashing:
+                            fp32_params_this_group_copy.append(param.detach().clone())
                         param_group['params'][i] = param
 
                     else:
@@ -199,6 +213,9 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
             self.fp16_groups.append(fp16_params_this_group)
             self.fp32_from_fp16_groups.append(fp32_from_fp16_params_this_group)
             self.fp32_from_fp32_groups.append(fp32_params_this_group)
+            if self.weight_stashing:
+                self.fp32_from_fp16_groups_copy.append(fp32_from_fp16_params_this_group_copy)
+                self.fp32_from_fp32_groups_copy.append(fp32_params_this_group_copy)
 
         # Leverage state_dict() and load_state_dict() to
         # recast preexisting per-param state tensors
@@ -261,20 +278,25 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         return found_inf_flag
 
 
-    def _get_model_and_main_params_data_fp16(self):
+    def _get_model_and_main_params_data_fp16(self, from_copy=False):
         model_data = []
         main_data = []
+        if from_copy:
+            fp32_from_fp16_groups = self.fp32_from_fp16_groups_copy
+        else:
+            fp32_from_fp16_groups = self.fp32_from_fp16_groups
         for model_group, main_group in zip(self.fp16_groups,
-                                           self.fp32_from_fp16_groups):
+                                           fp32_from_fp16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 model_data.append(model_param.data)
                 main_data.append(main_param.data)
         return model_data, main_data
 
 
-    def _copy_main_params_to_model_params(self):
+    def _copy_main_params_to_model_params(self, from_copy=False):
         # Only needed for the fp16 params.
-        model_data, main_data = self._get_model_and_main_params_data_fp16()
+        model_data, main_data = self._get_model_and_main_params_data_fp16(
+            from_copy=from_copy)
         _multi_tensor_copy_this_to_that(this=main_data, that=model_data,
                                         overflow_buf=self._dummy_overflow_buf)
 
@@ -290,6 +312,42 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         self._copy_model_params_to_main_params()
 
 
+    def _copy(self):
+        for param_groups, param_groups_copy in [
+                [self.fp32_from_fp16_groups, self.fp32_from_fp16_groups_copy],
+                [self.fp32_from_fp32_groups, self.fp32_from_fp32_groups_copy]]:
+            for i, param_group in enumerate(param_groups):
+                for j, param in enumerate(param_group):
+                    param.data.copy_(param_groups_copy[i][j].data)
+        self.main_version = self.copy_version
+
+
+    def _swap(self):
+        for param_groups, param_groups_copy in [
+                [self.fp32_from_fp16_groups, self.fp32_from_fp16_groups_copy],
+                [self.fp32_from_fp32_groups, self.fp32_from_fp32_groups_copy]]:
+            for i, param_group in enumerate(param_groups):
+                for j, param in enumerate(param_group):
+                    param_copy = param.detach().clone()
+                    param.data.copy_(param_groups_copy[i][j].data)
+                    param_groups_copy[i][j].data.copy_(param_copy.data)
+        new_main_version = self.copy_version
+        self.copy_version = self.main_version
+        self.main_version = new_main_version
+
+
+    def swap_to_older_version(self):
+        if self.main_version != self.current_model_fp16_version:
+            self._copy_main_params_to_model_params(from_copy=False)
+            self.current_model_fp16_version = self.main_version
+        # TODO: Do something with fp32 params.
+
+    def swap_to_newer_version(self):
+        if self.copy_version != self.current_model_fp16_version:
+            self._copy_main_params_to_model_params(from_copy=True)
+            self.current_model_fp16_version = self.copy_version
+        # TODO: Do something with fp32 params.
+
     @torch.no_grad()
     def step(self):
 
@@ -300,30 +358,40 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         self._copy_model_grads_to_main_grads()
         timers('optimizer-copy-to-main-grad').stop()
 
-        # Unscale and check for inf/nan.
-        timers('optimizer-unscale-and-check-inf').start()
-        found_inf_flag = self._unscale_main_grads_and_check_for_nan()
-        timers('optimizer-unscale-and-check-inf').stop()
+        if not self.weight_stashing:
+            # Unscale and check for inf/nan.
+            timers('optimizer-unscale-and-check-inf').start()
+            found_inf_flag = self._unscale_main_grads_and_check_for_nan()
+            timers('optimizer-unscale-and-check-inf').stop()
 
-        # We are done with scaling gradients
-        # so we can update the loss scale.
-        self.grad_scaler.update(found_inf_flag)
+            # We are done with scaling gradients
+            # so we can update the loss scale.
+            self.grad_scaler.update(found_inf_flag)
 
-        # If we found inf/nan, skip the update.
-        if found_inf_flag:
-            return False
+            # If we found inf/nan, skip the update.
+            if found_inf_flag:
+                return False
 
-        # Clip the main gradients.
-        timers('optimizer-clip-main-grad').start()
-        self.clip_grad_norm(self.clip_grad)
-        timers('optimizer-clip-main-grad').stop()
+            # Clip the main gradients.
+            timers('optimizer-clip-main-grad').start()
+            self.clip_grad_norm(self.clip_grad)
+            timers('optimizer-clip-main-grad').stop()
+
+        if self.weight_stashing:
+            self._copy()
 
         # Step the optimizer.
         self.optimizer.step()
 
+        if self.weight_stashing:
+            self.main_version += 1
+            self._swap()
+
         # Update params from main params.
         timers('optimizer-copy-main-to-model-params').start()
         self._copy_main_params_to_model_params()
+        if self.weight_stashing:
+            self.current_model_fp16_version = self.main_version
         timers('optimizer-copy-main-to-model-params').stop()
 
         # Successful update.
@@ -335,6 +403,11 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         state_dict['optimizer'] = self.optimizer.state_dict()
         state_dict['grad_scaler'] = self.grad_scaler.state_dict()
         state_dict['fp32_from_fp16_params'] = self.fp32_from_fp16_groups
+        if self.weight_stashing:
+            state_dict['main_version'] = self.main_version
+            state_dict['copy_version'] = self.copy_version
+            state_dict['fp32_from_fp16_params_copy'] = self.fp32_from_fp16_groups_copy
+            state_dict['fp32_from_fp32_params_copy'] = self.fp32_from_fp32_groups_copy
         return state_dict
 
 
@@ -363,6 +436,26 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                 state_dict[fp32_from_fp16_params_key]):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
+        if self.weight_stashing:
+            self.main_version = state_dict.get('main_version', 0)
+            self.copy_version = state_dict.get('copy_version', 0)
+            if 'fp32_from_fp16_params_copy' in state_dict and \
+                    'fp32_from_fp32_params_copy' in state_dict:
+                # Load the copy of parameters from checkpoint if available.
+                for current_groups, saved_groups in [
+                        [self.fp32_from_fp16_groups_copy, state_dict['fp32_from_fp16_params_copy']],
+                        [self.fp32_from_fp32_groups_copy, state_dict['fp32_from_fp32_params_copy']]]:
+                    for current_group, saved_group in zip(current_groups, saved_groups):
+                        for current, saved in zip(current_group, saved_group):
+                            current.data.copy_(saved.data)
+            else:
+                # Copy loaded parameters into copy if not available in checkpoint.
+                for param_groups, param_groups_copy in [
+                        [self.fp32_from_fp16_groups, self.fp32_from_fp16_groups_copy],
+                        [self.fp32_from_fp32_groups, self.fp32_from_fp32_groups_copy]]:
+                    for i, param_group in enumerate(param_groups):
+                        for j, param in enumerate(param_group):
+                            param_groups_copy[i][j].data.copy_(param.data)
 
 
 
